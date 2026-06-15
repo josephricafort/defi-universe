@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
+// Used only for Z1 system view — orbiting around a focused chain position
 export function createOrbitControls(
   camera: THREE.PerspectiveCamera,
   domElement: HTMLElement
@@ -8,20 +9,15 @@ export function createOrbitControls(
   const controls = new OrbitControls(camera, domElement);
 
   controls.enableDamping = true;
-  controls.dampingFactor = 0.05;
-  controls.rotateSpeed = 0.55;
-  controls.zoomSpeed = 0.9;
-  controls.panSpeed = 0.8;
-
-  // Free navigation — no orbit lock, no auto-rotate
-  controls.enablePan = true;
+  controls.dampingFactor = 0.06;
+  controls.rotateSpeed = 0.5;
+  controls.zoomSpeed = 0.8;
+  controls.enablePan = false;
   controls.autoRotate = false;
 
-  // Universe view zoom range
-  controls.minDistance = 15;
-  controls.maxDistance = 500;
+  controls.minDistance = 8;
+  controls.maxDistance = 80;
 
-  // No polar clamping — free vertical orbit
   controls.minPolarAngle = 0;
   controls.maxPolarAngle = Math.PI;
 

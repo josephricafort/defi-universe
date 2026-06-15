@@ -4,11 +4,9 @@ import type { WormholeEdge } from "@/lib/data/bridges";
 export interface Wormhole {
   tubeGroup: THREE.Group;
   edge: WormholeEdge;
-  volume24h: number;
   curve: THREE.QuadraticBezierCurve3;
   particles: WormholeParticle[];
-  baseOpacity: number; // volume-derived, used by fadeWormholes
-  opacity: number;     // current fade multiplier [0..1]
+  opacity: number; // current fade multiplier [0..1]
 }
 
 interface WormholeParticle {
@@ -17,24 +15,11 @@ interface WormholeParticle {
   speed: number;
 }
 
-// Scene units span ±130; tube radius needs to be visible at that scale.
-// sqrt scale from $25M–$2B → radius 1.2–4.0 scene units.
-function volumeToRadius(vol: number): number {
-  const minR = 1.2;
-  const maxR = 4.0;
-  const sqrtMin = Math.sqrt(20_000_000);
-  const sqrtMax = Math.sqrt(2_000_000_000);
-  const v = Math.min(Math.max(Math.sqrt(vol), sqrtMin), sqrtMax);
-  return minR + ((v - sqrtMin) / (sqrtMax - sqrtMin)) * (maxR - minR);
-}
-
-// Log scale → opacity 0.25–0.65
-function volumeToOpacity(vol: number): number {
-  const lo = Math.log10(20_000_000);
-  const hi = Math.log10(2_000_000_000);
-  const v = Math.min(Math.max(Math.log10(Math.max(vol, 1)), lo), hi);
-  return 0.25 + ((v - lo) / (hi - lo)) * 0.40;
-}
+// Uniform visual encoding: tubes encode connection existence only, not volume.
+// Volume data is unavailable (bridges.llama.fi is paywalled) and tube thickness
+// should encode flow magnitude — a channel we cannot fill honestly.
+const TUBE_RADIUS = 0.55;    // scene units — thin but visible at ±130 spread
+const TUBE_OPACITY = 0.35;   // low alpha so tubes don't overwhelm the galaxy orbs
 
 function makeParticleTexture(): THREE.Texture {
   const size = 128;
@@ -71,8 +56,6 @@ export function createWormholes(edges: WormholeEdge[]): {
 
   for (const edge of edges) {
     const tubeGroup = new THREE.Group();
-    const baseOpacity = volumeToOpacity(edge.volume24h);
-    const radius = volumeToRadius(edge.volume24h);
 
     const p0 = new THREE.Vector3(...edge.from.position);
     const p2 = new THREE.Vector3(...edge.to.position);
@@ -84,11 +67,11 @@ export function createWormholes(edges: WormholeEdge[]): {
     const curve = new THREE.QuadraticBezierCurve3(p0, mid, p2);
 
     // ── Tube mesh ───────────────────────────────────────────────────────────
-    const tubeGeo = new THREE.TubeGeometry(curve, 48, radius, 6, false);
+    const tubeGeo = new THREE.TubeGeometry(curve, 48, TUBE_RADIUS, 6, false);
     const tubeMat = new THREE.MeshBasicMaterial({
       color: new THREE.Color(0x4488ff),
       transparent: true,
-      opacity: baseOpacity,
+      opacity: TUBE_OPACITY,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
       side: THREE.DoubleSide,
@@ -99,7 +82,7 @@ export function createWormholes(edges: WormholeEdge[]): {
     // ── Flowing particles ───────────────────────────────────────────────────
     const PARTICLE_COUNT = 3;
     const particles: WormholeParticle[] = [];
-    const particleSize = radius * 5;
+    const particleSize = TUBE_RADIUS * 8;
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       const mat = new THREE.SpriteMaterial({
@@ -107,12 +90,12 @@ export function createWormholes(edges: WormholeEdge[]): {
         blending: THREE.AdditiveBlending,
         transparent: true,
         depthWrite: false,
-        opacity: Math.min(baseOpacity * 2.0, 0.9),
+        opacity: 0.6,
       });
       const sprite = new THREE.Sprite(mat);
       sprite.scale.set(particleSize, particleSize, 1);
 
-      const t = i / PARTICLE_COUNT; // evenly staggered start positions
+      const t = i / PARTICLE_COUNT;
       sprite.position.copy(curve.getPoint(t));
       tubeGroup.add(sprite);
 
@@ -127,10 +110,8 @@ export function createWormholes(edges: WormholeEdge[]): {
     wormholes.push({
       tubeGroup,
       edge,
-      volume24h: edge.volume24h,
       curve,
       particles,
-      baseOpacity,
       opacity: 1,
     });
   }
@@ -147,18 +128,16 @@ export function tickWormholes(wormholes: Wormhole[], delta: number) {
   }
 }
 
-// targetMult: 0 = invisible, 1 = full volume-scaled opacity
+// targetMult: 0 = invisible, 1 = full opacity
 export function fadeWormholes(wormholes: Wormhole[], targetMult: number, alpha: number) {
   for (const wh of wormholes) {
     wh.opacity = THREE.MathUtils.lerp(wh.opacity, targetMult, alpha);
 
     for (const child of wh.tubeGroup.children) {
       if (child instanceof THREE.Mesh) {
-        (child.material as THREE.MeshBasicMaterial).opacity =
-          wh.baseOpacity * wh.opacity;
+        (child.material as THREE.MeshBasicMaterial).opacity = TUBE_OPACITY * wh.opacity;
       } else if (child instanceof THREE.Sprite) {
-        (child.material as THREE.SpriteMaterial).opacity =
-          Math.min(wh.baseOpacity * 2.0, 0.9) * wh.opacity;
+        (child.material as THREE.SpriteMaterial).opacity = 0.6 * wh.opacity;
       }
     }
   }

@@ -5,23 +5,97 @@ function easeInOutQuad(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 }
 
-export interface FlyToOptions {
-  duration?: number; // seconds, default 1.2
-  offsetDistance?: number; // how far from target center, default 30
-}
-
 export interface FlyHandle {
   cancel: () => void;
   promise: Promise<void>;
 }
 
-// Tweens camera.position and controls.target to look at `targetPosition`.
-// Returns a handle so the caller can cancel mid-flight.
+// Tween camera position + quaternion toward a target position.
+// Used during Z0→Z1 transition where FlyControls is active (no controls.target).
+export function tweenCamera(
+  camera: THREE.PerspectiveCamera,
+  toPosition: THREE.Vector3,
+  toLookAt: THREE.Vector3,
+  duration = 1.2
+): FlyHandle {
+  const fromPos = camera.position.clone();
+  const fromQuat = camera.quaternion.clone();
+
+  // Compute target quaternion by pointing a temp camera at toLookAt
+  const tempCam = camera.clone();
+  tempCam.position.copy(toPosition);
+  tempCam.lookAt(toLookAt);
+  const toQuat = tempCam.quaternion.clone();
+
+  let elapsed = 0;
+  let cancelled = false;
+  let rafId: number;
+
+  const promise = new Promise<void>((resolve) => {
+    function tick(dt: number) {
+      if (cancelled) { resolve(); return; }
+      elapsed += dt;
+      const t = Math.min(elapsed / duration, 1);
+      const e = easeInOutQuad(t);
+      camera.position.lerpVectors(fromPos, toPosition, e);
+      camera.quaternion.slerpQuaternions(fromQuat, toQuat, e);
+      if (t < 1) {
+        rafId = requestAnimationFrame(() => tick(1 / 60));
+      } else {
+        resolve();
+      }
+    }
+    rafId = requestAnimationFrame(() => tick(1 / 60));
+  });
+
+  return {
+    cancel: () => { cancelled = true; cancelAnimationFrame(rafId); },
+    promise,
+  };
+}
+
+// Used for Z1→Z0 return: tween camera back to saved home position + orientation
+export function tweenCameraBack(
+  camera: THREE.PerspectiveCamera,
+  toPosition: THREE.Vector3,
+  toQuaternion: THREE.Quaternion,
+  duration = 1.2
+): FlyHandle {
+  const fromPos = camera.position.clone();
+  const fromQuat = camera.quaternion.clone();
+  let elapsed = 0;
+  let cancelled = false;
+  let rafId: number;
+
+  const promise = new Promise<void>((resolve) => {
+    function tick(dt: number) {
+      if (cancelled) { resolve(); return; }
+      elapsed += dt;
+      const t = Math.min(elapsed / duration, 1);
+      const e = easeInOutQuad(t);
+      camera.position.lerpVectors(fromPos, toPosition, e);
+      camera.quaternion.slerpQuaternions(fromQuat, toQuaternion, e);
+      if (t < 1) {
+        rafId = requestAnimationFrame(() => tick(1 / 60));
+      } else {
+        resolve();
+      }
+    }
+    rafId = requestAnimationFrame(() => tick(1 / 60));
+  });
+
+  return {
+    cancel: () => { cancelled = true; cancelAnimationFrame(rafId); },
+    promise,
+  };
+}
+
+// OrbitControls-based fly-to — used inside Z1 view for protocol star focus
 export function flyTo(
   camera: THREE.PerspectiveCamera,
   controls: OrbitControls,
   targetPosition: THREE.Vector3,
-  options: FlyToOptions = {}
+  options: { duration?: number; offsetDistance?: number } = {}
 ): FlyHandle {
   const duration = options.duration ?? 1.2;
   const offsetDistance = options.offsetDistance ?? 30;
@@ -29,7 +103,6 @@ export function flyTo(
   const fromPos = camera.position.clone();
   const fromTarget = controls.target.clone();
 
-  // Approach from current camera direction, stopping `offsetDistance` away
   const dir = camera.position.clone().sub(targetPosition).normalize();
   const toPos = targetPosition.clone().add(dir.multiplyScalar(offsetDistance));
   const toTarget = targetPosition.clone();
@@ -41,54 +114,11 @@ export function flyTo(
   const promise = new Promise<void>((resolve) => {
     function tick(dt: number) {
       if (cancelled) { resolve(); return; }
-
       elapsed += dt;
       const t = Math.min(elapsed / duration, 1);
       const e = easeInOutQuad(t);
-
       camera.position.lerpVectors(fromPos, toPos, e);
       controls.target.lerpVectors(fromTarget, toTarget, e);
-      controls.update();
-
-      if (t < 1) {
-        rafId = requestAnimationFrame(() => tick(1 / 60));
-      } else {
-        resolve();
-      }
-    }
-    rafId = requestAnimationFrame(() => tick(1 / 60));
-  });
-
-  return {
-    cancel: () => {
-      cancelled = true;
-      cancelAnimationFrame(rafId);
-    },
-    promise,
-  };
-}
-
-export function flyBack(
-  camera: THREE.PerspectiveCamera,
-  controls: OrbitControls,
-  homePos: THREE.Vector3,
-  homeTarget: THREE.Vector3,
-  duration = 1.2
-): FlyHandle {
-  const fromPos = camera.position.clone();
-  const fromTarget = controls.target.clone();
-  let elapsed = 0;
-  let cancelled = false;
-  let rafId: number;
-
-  const promise = new Promise<void>((resolve) => {
-    function tick(dt: number) {
-      if (cancelled) { resolve(); return; }
-      elapsed += dt;
-      const t = Math.min(elapsed / duration, 1);
-      const e = easeInOutQuad(t);
-      camera.position.lerpVectors(fromPos, homePos, e);
-      controls.target.lerpVectors(fromTarget, homeTarget, e);
       controls.update();
       if (t < 1) {
         rafId = requestAnimationFrame(() => tick(1 / 60));
@@ -105,11 +135,9 @@ export function flyBack(
   };
 }
 
-// Lerp the opacity of a PointsMaterial or SpriteMaterial toward `target`
 export function fadePoints(points: THREE.Points, targetOpacity: number, alpha: number) {
   const mat = points.material as THREE.PointsMaterial;
   mat.opacity = THREE.MathUtils.lerp(mat.opacity, targetOpacity, alpha);
-  mat.needsUpdate = true;
 }
 
 export function fadeOrbs(
@@ -125,3 +153,6 @@ export function fadeOrbs(
     gMat.opacity = THREE.MathUtils.lerp(gMat.opacity ?? 1, targetOpacity, alpha);
   }
 }
+
+// Keep flyBack as alias for backward compat
+export const flyBack = flyTo;

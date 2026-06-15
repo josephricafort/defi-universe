@@ -3,7 +3,9 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import * as THREE from "three";
+import type { FlyControls } from "three/examples/jsm/controls/FlyControls.js";
 import type { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { createFlyControls, applyScrollZoom } from "@/lib/controls/flyControls";
 import { createOrbitControls } from "@/lib/controls/orbitControls";
 import { pickOrb } from "@/lib/controls/raycaster";
 import { pickStar } from "@/lib/controls/starRaycaster";
@@ -11,19 +13,14 @@ import { createGalaxyField, tickOrbs, type ChainOrb } from "@/lib/scene/galaxyFi
 import { createStarfield } from "@/lib/scene/starfield";
 import { createChainLabel, formatTVL } from "@/lib/scene/labels";
 import { createSystemView, tickStars, type ProtocolStar } from "@/lib/scene/systemView";
-import { flyTo, flyBack, fadePoints, fadeOrbs } from "@/lib/camera/flyTo";
+import { tweenCamera, tweenCameraBack, flyTo, fadePoints, fadeOrbs } from "@/lib/camera/flyTo";
 import { fetchChains, type Chain, type FetchStatus, CHAIN_CATALOG } from "@/lib/data/chains";
 import { getProtocolsForChain, fetchProtocolFees, type Protocol } from "@/lib/data/protocols";
 import { fetchWormholeEdges } from "@/lib/data/bridges";
-import {
-  createWormholes,
-  tickWormholes,
-  fadeWormholes,
-  type Wormhole,
-} from "@/lib/scene/wormholes";
+import { createWormholes, tickWormholes, fadeWormholes, type Wormhole } from "@/lib/scene/wormholes";
 
 interface Props {
-  initialChain?: string; // chain id, e.g. "ethereum" — set when entering via /chain/[chain]
+  initialChain?: string;
 }
 
 type ViewState = "universe" | "flying-in" | "system" | "flying-out";
@@ -45,11 +42,11 @@ interface DashboardState {
   feesLoading: boolean;
 }
 
-// Mutable scene refs passed between the useEffect closure and event handlers
 interface SceneRefs {
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
-  controls: OrbitControls;
+  flyControls: FlyControls;       // Z0 universe — free fly
+  orbitControls: OrbitControls;   // Z1 system — orbit around focused chain
   orbs: ChainOrb[];
   stars: ProtocolStar[];
   starfield: THREE.Points;
@@ -57,7 +54,7 @@ interface SceneRefs {
   wormholes: Wormhole[];
   wormholeGroup: THREE.Group | null;
   homePos: THREE.Vector3;
-  homeTarget: THREE.Vector3;
+  homeQuat: THREE.Quaternion;     // saved camera orientation for return tween
   viewState: ViewState;
   focusedChain: Chain | null;
 }
@@ -73,119 +70,103 @@ export default function CosmosScene({ initialChain }: Props) {
   const [wormholeHover, setWormholeHover] = useState<{ label: string; x: number; y: number } | null>(null);
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
 
-  // ── Load protocols + enter system view for a chain ─────────────────────────
+  // ── Enter Z1: fly camera to chain, swap controls, build protocol stars ──────
   const enterSystemView = useCallback(async (chain: Chain, refs: SceneRefs) => {
-    const scene = refs.scene;
     if (refs.viewState === "flying-in" || refs.viewState === "system") return;
     refs.viewState = "flying-in";
     setViewState("flying-in");
-
     refs.focusedChain = chain;
 
-    // Initialise dashboard immediately with loading state
-    setDashboard({
-      chain,
-      protocols: [],
-      protocolsLoading: true,
-      protocolsError: false,
-      selectedProtocol: null,
-      fees: null,
-      feesLoading: false,
-    });
-
-    // Update URL
     router.replace(`/chain/${chain.id}`, { scroll: false });
 
-    // Fly camera to chain orb — proximity fade handles orbs/starfield in render loop
-    const chainPos = new THREE.Vector3(...chain.position);
-    const handle = flyTo(refs.camera, refs.controls, chainPos, { offsetDistance: 28 });
-    refs.controls.enabled = false;
+    setDashboard({
+      chain, protocols: [], protocolsLoading: true,
+      protocolsError: false, selectedProtocol: null, fees: null, feesLoading: false,
+    });
 
+    // Disable fly controls during tween
+    refs.flyControls.enabled = false;
+
+    const chainPos = new THREE.Vector3(...chain.position);
+    // Approach from 30 units above-and-back of the chain
+    const toPos = chainPos.clone().add(new THREE.Vector3(0, 12, 30));
+
+    const handle = tweenCamera(refs.camera, toPos, chainPos, 1.3);
     await handle.promise;
 
-    // Snap wormholes fully off now that we've arrived
+    // Snap wormholes off and fully dim non-focused orbs
     fadeWormholes(refs.wormholes, 0, 1);
+    fadeOrbs(refs.orbs.filter(o => o.chain.id !== chain.id), 0.06, 1);
+    fadePoints(refs.starfield, 0.05, 1);
 
-    // Fetch protocols
+    // Switch to orbit controls centred on this chain
+    refs.flyControls.enabled = false;
+    refs.orbitControls.target.copy(chainPos);
+    refs.orbitControls.enabled = true;
+    refs.orbitControls.update();
+
+    // Fetch + build protocol stars
     let protocols: Protocol[] = [];
     let error = false;
-    try {
-      protocols = await getProtocolsForChain(chain.llamaName);
-    } catch {
-      error = true;
-    }
+    try { protocols = await getProtocolsForChain(chain.llamaName); }
+    catch { error = true; }
 
-    // Build protocol stars in scene
-    if (refs.systemGroup) {
-      scene.remove(refs.systemGroup);
-    }
+    if (refs.systemGroup) refs.scene.remove(refs.systemGroup);
     const { group, stars } = createSystemView(protocols, chainPos);
-    scene.add(group);
+    refs.scene.add(group);
     refs.systemGroup = group;
     refs.stars = stars;
 
     refs.viewState = "system";
     setViewState("system");
-    refs.controls.enabled = true;
-    refs.controls.minDistance = 8;
-    refs.controls.maxDistance = 80;
 
     setDashboard({
-      chain,
-      protocols,
-      protocolsLoading: false,
-      protocolsError: error,
-      selectedProtocol: null,
-      fees: null,
-      feesLoading: false,
+      chain, protocols, protocolsLoading: false,
+      protocolsError: error, selectedProtocol: null, fees: null, feesLoading: false,
     });
   }, [router]);
 
-  // ── Return to universe view ────────────────────────────────────────────────
+  // ── Exit Z1: tween back, swap controls, restore Z0 scene ───────────────────
   const exitSystemView = useCallback(async (refs: SceneRefs) => {
-    const scene = refs.scene;
     if (refs.viewState !== "system") return;
     refs.viewState = "flying-out";
     setViewState("flying-out");
-    refs.controls.enabled = false;
 
     router.replace("/", { scroll: false });
 
-    const handle = flyBack(refs.camera, refs.controls, refs.homePos, refs.homeTarget);
+    // Disable orbit, start return tween
+    refs.orbitControls.enabled = false;
+    const handle = tweenCameraBack(refs.camera, refs.homePos, refs.homeQuat, 1.3);
 
-    // Fade orbs + wormholes back in while flying
-    const allOrbs = refs.orbs;
+    // Fade everything back in while flying out
     const fadeInterval = setInterval(() => {
-      fadeOrbs(allOrbs, 1, 0.08);
-      fadePoints(refs.starfield, 0.55, 0.08);
-      fadeWormholes(refs.wormholes, 1, 0.08);
+      fadeOrbs(refs.orbs, 1, 0.07);
+      fadePoints(refs.starfield, 0.55, 0.07);
+      fadeWormholes(refs.wormholes, 1, 0.07);
     }, 16);
 
     await handle.promise;
     clearInterval(fadeInterval);
 
-    // Ensure full opacity
-    fadeOrbs(allOrbs, 1, 1);
+    // Snap to full opacity
+    fadeOrbs(refs.orbs, 1, 1);
     fadePoints(refs.starfield, 0.55, 1);
     fadeWormholes(refs.wormholes, 1, 1);
 
-    // Remove system view
-    if (refs.systemGroup) {
-      scene.remove(refs.systemGroup);
-      refs.systemGroup = null;
-    }
+    // Tear down system view
+    if (refs.systemGroup) { refs.scene.remove(refs.systemGroup); refs.systemGroup = null; }
     refs.stars = [];
     refs.focusedChain = null;
+
+    // Re-enable fly controls
+    refs.flyControls.enabled = true;
+
     refs.viewState = "universe";
     setViewState("universe");
     setDashboard(null);
-
-    refs.controls.minDistance = 15;
-    refs.controls.maxDistance = 500;
-    refs.controls.enabled = true;
   }, [router]);
 
-  // ── Three.js setup ────────────────────────────────────────────────────────
+  // ── Three.js setup ──────────────────────────────────────────────────────────
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
@@ -202,13 +183,16 @@ export default function CosmosScene({ initialChain }: Props) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x04050a);
 
-    // Camera — start above and back from scene centroid (not Ethereum specifically)
-    const camera = new THREE.PerspectiveCamera(55, mount.clientWidth / mount.clientHeight, 0.5, 1200);
-    camera.position.set(0, 80, 200);
+    // Camera — start pulled back, looking at galaxy centroid
+    const camera = new THREE.PerspectiveCamera(
+      55, mount.clientWidth / mount.clientHeight, 0.5, 1500
+    );
+    camera.position.set(0, 80, 220);
+    camera.lookAt(0, 5, 0);
 
     // Lighting
     scene.add(new THREE.AmbientLight(0x1a1a3a, 3.5));
-    const keyLight = new THREE.PointLight(0xffffff, 4, 600);
+    const keyLight = new THREE.PointLight(0xffffff, 4, 800);
     keyLight.position.set(30, 120, 60);
     scene.add(keyLight);
 
@@ -216,83 +200,90 @@ export default function CosmosScene({ initialChain }: Props) {
     const starfield = createStarfield();
     scene.add(starfield);
 
-    // Controls — target the rough centroid of the galaxy, not (0,0,0) = Ethereum
-    const controls = createOrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 5, 0); // slight Y offset to centre the spread visually
-    controls.update();
-    const homePos = camera.position.clone();
-    const homeTarget = controls.target.clone();
+    // Z0 controls: FlyControls — free navigation, no fixed pivot
+    const flyControls = createFlyControls(camera, renderer.domElement);
 
-    // Mutable refs shared with callbacks
+    // Z1 controls: OrbitControls — orbit around focused chain (disabled at start)
+    const orbitControls = createOrbitControls(camera, renderer.domElement);
+    orbitControls.enabled = false;
+
+    // Save home state for return tween
+    const homePos = camera.position.clone();
+    const homeQuat = camera.quaternion.clone();
+
     const refs: SceneRefs = {
-      scene,
-      camera,
-      controls,
-      orbs: [],
-      stars: [],
+      scene, camera,
+      flyControls, orbitControls,
+      orbs: [], stars: [],
       starfield,
       systemGroup: null,
-      wormholes: [],
-      wormholeGroup: null,
-      homePos,
-      homeTarget,
+      wormholes: [], wormholeGroup: null,
+      homePos, homeQuat,
       viewState: "universe",
       focusedChain: null,
     };
     sceneRef.current = refs;
 
-    // Render loop
+    // Scroll wheel zoom — move camera forward/back along look direction
+    function onWheel(e: WheelEvent) {
+      if (refs.viewState === "universe") {
+        e.preventDefault();
+        applyScrollZoom(camera, e, 0.15);
+      }
+    }
+    mount.addEventListener("wheel", onWheel, { passive: false });
+
+    // ── Render loop ─────────────────────────────────────────────────────────
     const clock = new THREE.Clock();
     let animId: number;
 
     function animate() {
       animId = requestAnimationFrame(animate);
       const delta = clock.getDelta();
+
+      if (refs.viewState === "universe") {
+        flyControls.update(delta);
+
+        // Proximity fade: other orbs fade as camera nears any orb
+        if (refs.orbs.length > 0) {
+          let minDist = Infinity;
+          let closestOrb: ChainOrb | null = null;
+          for (const orb of refs.orbs) {
+            const d = camera.position.distanceTo(orb.mesh.position);
+            if (d < minDist) { minDist = d; closestOrb = orb; }
+          }
+          const FADE_START = 70;
+          const FADE_FULL  = 22;
+          if (closestOrb && minDist < FADE_START) {
+            const t = 1 - Math.min((minDist - FADE_FULL) / (FADE_START - FADE_FULL), 1);
+            for (const orb of refs.orbs) {
+              const near = orb === closestOrb;
+              const mat = orb.mesh.material as THREE.MeshStandardMaterial;
+              mat.transparent = true;
+              mat.opacity = THREE.MathUtils.lerp(mat.opacity ?? 1, near ? 1 : THREE.MathUtils.lerp(1, 0.06, t), 0.06);
+              const gMat = orb.glowSprite.material as THREE.SpriteMaterial;
+              gMat.opacity = THREE.MathUtils.lerp(gMat.opacity ?? 1, near ? 1 : THREE.MathUtils.lerp(1, 0.06, t), 0.06);
+            }
+            fadePoints(refs.starfield, THREE.MathUtils.lerp(0.55, 0.06, t), 0.06);
+            fadeWormholes(refs.wormholes, THREE.MathUtils.lerp(1, 0, t), 0.06);
+          } else {
+            for (const orb of refs.orbs) {
+              const mat = orb.mesh.material as THREE.MeshStandardMaterial;
+              mat.opacity = THREE.MathUtils.lerp(mat.opacity ?? 1, 1, 0.06);
+              const gMat = orb.glowSprite.material as THREE.SpriteMaterial;
+              gMat.opacity = THREE.MathUtils.lerp(gMat.opacity ?? 1, 1, 0.06);
+            }
+            fadePoints(refs.starfield, 0.55, 0.06);
+            fadeWormholes(refs.wormholes, 1, 0.06);
+          }
+        }
+      } else if (refs.viewState === "system") {
+        orbitControls.update();
+      }
+
       tickOrbs(refs.orbs, delta);
       tickStars(refs.stars, delta);
       tickWormholes(refs.wormholes, delta);
-      controls.update();
-
-      // Proximity fade: as camera approaches any orb during free navigation,
-      // fade other orbs + wormholes so the target chain stands out naturally.
-      if (refs.viewState === "universe" && refs.orbs.length > 0) {
-        // Find the closest orb to camera
-        let minDist = Infinity;
-        let closestOrb: ChainOrb | null = null;
-        for (const orb of refs.orbs) {
-          const d = camera.position.distanceTo(orb.mesh.position);
-          if (d < minDist) { minDist = d; closestOrb = orb; }
-        }
-        // When camera is within 60 units of an orb, fade others proportionally
-        const FADE_START = 60;
-        const FADE_FULL = 20; // at this distance others are nearly invisible
-        if (closestOrb && minDist < FADE_START) {
-          const t = 1 - Math.min((minDist - FADE_FULL) / (FADE_START - FADE_FULL), 1);
-          const otherOpacity = THREE.MathUtils.lerp(1, 0.06, t);
-          const wormholeOpacity = THREE.MathUtils.lerp(1, 0, t);
-          for (const orb of refs.orbs) {
-            const isClose = orb === closestOrb;
-            const mat = orb.mesh.material as THREE.MeshStandardMaterial;
-            mat.transparent = true;
-            mat.opacity = isClose ? 1 : otherOpacity;
-            const gMat = orb.glowSprite.material as THREE.SpriteMaterial;
-            gMat.opacity = isClose ? 1 : otherOpacity;
-          }
-          fadePoints(refs.starfield, THREE.MathUtils.lerp(0.55, 0.06, t), 0.05);
-          fadeWormholes(refs.wormholes, wormholeOpacity, 0.05);
-        } else {
-          // Restore full opacity when away from any orb
-          for (const orb of refs.orbs) {
-            const mat = orb.mesh.material as THREE.MeshStandardMaterial;
-            mat.opacity = THREE.MathUtils.lerp(mat.opacity ?? 1, 1, 0.05);
-            const gMat = orb.glowSprite.material as THREE.SpriteMaterial;
-            gMat.opacity = THREE.MathUtils.lerp(gMat.opacity ?? 1, 1, 0.05);
-          }
-          fadePoints(refs.starfield, 0.55, 0.05);
-          fadeWormholes(refs.wormholes, 1, 0.05);
-        }
-      }
-
       renderer.render(scene, camera);
     }
     animate();
@@ -318,55 +309,43 @@ export default function CosmosScene({ initialChain }: Props) {
 
       orbs.forEach((orb) => {
         const r = (orb.mesh.geometry as THREE.SphereGeometry).parameters.radius;
-        const label = createChainLabel(orb.chain, r);
-        orb.mesh.add(label);
+        orb.mesh.add(createChainLabel(orb.chain, r));
       });
 
-      // Fetch bridge volume — fire-and-forget, Z0 works fine without it
+      // Wormholes — uniform topology lines, existence only
       fetchWormholeEdges().then((edges) => {
         if (destroyed) return;
         const { group: wGroup, wormholes } = createWormholes(edges);
         scene.add(wGroup);
         refs.wormholes = wormholes;
         refs.wormholeGroup = wGroup;
-      }).catch(() => { /* graceful degradation — no wormholes */ });
+      }).catch(() => {});
 
-      // If entering via /chain/[id], fly in automatically after galaxy is built
+      // Direct load into Z1 view
       if (initialChain) {
-        const target = chains.find((c) => c.id === initialChain)
-          ?? CHAIN_CATALOG.find((c) => c.id === initialChain);
+        const target = chains.find(c => c.id === initialChain)
+          ?? CHAIN_CATALOG.find(c => c.id === initialChain);
         if (target) {
-          // Jump camera to chain on direct load (no fly animation needed)
           const chainPos = new THREE.Vector3(...target.position);
-          const dir = new THREE.Vector3(0, 1, 1).normalize();
-          camera.position.copy(chainPos.clone().add(dir.multiplyScalar(28)));
-          controls.target.copy(chainPos);
-          controls.update();
+          camera.position.copy(chainPos.clone().add(new THREE.Vector3(0, 12, 30)));
+          camera.lookAt(chainPos);
           await enterSystemView(target, refs);
         }
       }
     });
 
-    // ── Wormhole tube raycaster (inline — small enough to not need a separate file) ──
-    function pickWormholeTube(
-      e: MouseEvent,
-      container: HTMLElement,
-      cam: THREE.Camera,
-      whs: Wormhole[]
-    ): Wormhole | null {
-      if (whs.length === 0) return null;
-      const rect = container.getBoundingClientRect();
+    // ── Inline wormhole raycaster ────────────────────────────────────────────
+    function pickWormholeTube(e: MouseEvent): Wormhole | null {
+      if (refs.wormholes.length === 0) return null;
+      const rect = mount!.getBoundingClientRect();
       const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       const ray = new THREE.Raycaster();
-      ray.params.Line = { threshold: 0.5 };
-      ray.setFromCamera(new THREE.Vector2(x, y), cam);
-      // Only test tube meshes (first child of each tubeGroup)
-      const tubes = whs.map((w) => w.tubeGroup.children[0] as THREE.Mesh);
+      ray.setFromCamera(new THREE.Vector2(x, y), camera);
+      const tubes = refs.wormholes.map(w => w.tubeGroup.children[0] as THREE.Mesh);
       const hits = ray.intersectObjects(tubes, false);
-      if (hits.length === 0) return null;
-      const hitMesh = hits[0].object;
-      return whs.find((w) => w.tubeGroup.children[0] === hitMesh) ?? null;
+      if (!hits.length) return null;
+      return refs.wormholes.find(w => w.tubeGroup.children[0] === hits[0].object) ?? null;
     }
 
     // ── Hover ────────────────────────────────────────────────────────────────
@@ -384,17 +363,11 @@ export default function CosmosScene({ initialChain }: Props) {
           document.body.style.cursor = "pointer";
         } else {
           setHovered(null);
-          // Raycast wormhole tubes only when no orb is under cursor
-          const wHit = pickWormholeTube(e, mount!, camera, refs.wormholes);
-          if (wHit) {
-            setWormholeHover({
-              label: `${wHit.edge.to.name} ↔ Ethereum · ${formatTVL(wHit.volume24h)} (24h)`,
-              x: e.clientX - rect.left,
-              y: e.clientY - rect.top,
-            });
-          } else {
-            setWormholeHover(null);
-          }
+          const wHit = pickWormholeTube(e);
+          setWormholeHover(wHit ? {
+            label: `${wHit.edge.from.name} ↔ ${wHit.edge.to.name}`,
+            x: e.clientX - rect.left, y: e.clientY - rect.top,
+          } : null);
           document.body.style.cursor = "default";
         }
         if (hoveredOrbRef && hoveredOrbRef !== hit?.orb) {
@@ -431,35 +404,23 @@ export default function CosmosScene({ initialChain }: Props) {
       }
     }
 
-    // ── Click ─────────────────────────────────────────────────────────────────
+    // ── Click ────────────────────────────────────────────────────────────────
     function onClick(e: MouseEvent) {
       if (refs.viewState === "universe") {
         const hit = pickOrb(e, mount!, camera, refs.orbs);
-        if (hit) {
-          enterSystemView(hit.orb.chain, refs);
-        }
+        if (hit) enterSystemView(hit.orb.chain, refs);
       } else if (refs.viewState === "system") {
         const hit = pickStar(e, mount!, camera, refs.stars);
         if (hit) {
           const { protocol } = hit.star;
-
-          // Highlight clicked star, dim others
-          refs.stars.forEach((s) => {
+          refs.stars.forEach(s => {
             (s.mesh.material as THREE.MeshStandardMaterial).emissiveIntensity =
               s === hit.star ? 1.8 : 0.3;
           });
-
-          setDashboard((prev) =>
-            prev
-              ? { ...prev, selectedProtocol: protocol, fees: null, feesLoading: true }
-              : null
+          setDashboard(prev => prev ? { ...prev, selectedProtocol: protocol, fees: null, feesLoading: true } : null);
+          fetchProtocolFees(protocol.slug).then(fees =>
+            setDashboard(prev => prev ? { ...prev, fees, feesLoading: false } : null)
           );
-
-          fetchProtocolFees(protocol.slug).then((fees) => {
-            setDashboard((prev) =>
-              prev ? { ...prev, fees, feesLoading: false } : null
-            );
-          });
         }
       }
     }
@@ -472,9 +433,11 @@ export default function CosmosScene({ initialChain }: Props) {
       destroyed = true;
       cancelAnimationFrame(animId);
       window.removeEventListener("resize", onResize);
+      mount.removeEventListener("wheel", onWheel);
       renderer.domElement.removeEventListener("mousemove", onMouseMove);
       renderer.domElement.removeEventListener("click", onClick);
-      controls.dispose();
+      flyControls.dispose();
+      orbitControls.dispose();
       renderer.dispose();
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       document.body.style.cursor = "default";
@@ -485,31 +448,30 @@ export default function CosmosScene({ initialChain }: Props) {
 
   const handleExitClick = useCallback(() => {
     const refs = sceneRef.current;
-    if (!refs) return;
-    exitSystemView(refs);
+    if (refs) exitSystemView(refs);
   }, [exitSystemView]);
 
   return (
     <div className="relative w-full h-full">
-      {/* Three.js canvas */}
       <div ref={mountRef} className="w-full h-full" />
 
-      {/* Status pill — top right (hide when in system view) */}
+      {/* FlyControls hint — only in universe view */}
+      {viewState === "universe" && (
+        <p className="pointer-events-none absolute bottom-5 left-1/2 z-20 -translate-x-1/2 select-none text-xs text-white/25">
+          W A S D to fly · hold mouse drag to look · scroll to zoom · click a chain
+        </p>
+      )}
+
+      {/* Status pill */}
       {viewState === "universe" && (
         <div className="pointer-events-none absolute right-5 top-5 z-20 flex items-center gap-2 rounded-full border border-white/10 bg-black/50 px-3 py-1.5 backdrop-blur-sm">
-          {dataStatus === "loading" && (
-            <><span className="h-2 w-2 animate-pulse rounded-full bg-white/40" /><span className="text-xs text-white/40">Connecting…</span></>
-          )}
-          {dataStatus === "live" && (
-            <><span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" /><span className="text-xs text-white/60">Live · <span className="text-white/80">DeFiLlama</span></span></>
-          )}
-          {dataStatus === "fallback" && (
-            <><span className="h-2 w-2 rounded-full bg-amber-400" /><span className="text-xs text-white/60">Snapshot data</span></>
-          )}
+          {dataStatus === "loading" && (<><span className="h-2 w-2 animate-pulse rounded-full bg-white/40" /><span className="text-xs text-white/40">Connecting…</span></>)}
+          {dataStatus === "live"    && (<><span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" /><span className="text-xs text-white/60">Live · <span className="text-white/80">DeFiLlama</span></span></>)}
+          {dataStatus === "fallback"&& (<><span className="h-2 w-2 rounded-full bg-amber-400" /><span className="text-xs text-white/60">Snapshot data</span></>)}
         </div>
       )}
 
-      {/* ← Universe button */}
+      {/* ← Universe */}
       {(viewState === "system" || viewState === "flying-out") && (
         <button
           onClick={handleExitClick}
@@ -519,36 +481,29 @@ export default function CosmosScene({ initialChain }: Props) {
         </button>
       )}
 
-      {/* Hover tooltip — orb or protocol star */}
+      {/* Hover tooltip */}
       {hovered && (
-        <div
-          className="pointer-events-none absolute z-10 rounded-xl border border-white/10 bg-black/75 px-3 py-2 text-sm backdrop-blur-sm"
-          style={{ left: hovered.x + 16, top: hovered.y - 12 }}
-        >
+        <div className="pointer-events-none absolute z-10 rounded-xl border border-white/10 bg-black/75 px-3 py-2 text-sm backdrop-blur-sm"
+          style={{ left: hovered.x + 16, top: hovered.y - 12 }}>
           <p className="font-semibold text-white">{hovered.label}</p>
           <p className="text-white/55">{hovered.sub}</p>
         </div>
       )}
 
-      {/* Wormhole hover tooltip */}
+      {/* Wormhole hover tooltip — connection only, no volume claim */}
       {wormholeHover && !hovered && (
-        <div
-          className="pointer-events-none absolute z-10 rounded-xl border border-indigo-500/20 bg-black/75 px-3 py-2 text-xs backdrop-blur-sm"
-          style={{ left: wormholeHover.x + 16, top: wormholeHover.y - 12 }}
-        >
+        <div className="pointer-events-none absolute z-10 rounded-xl border border-indigo-500/20 bg-black/75 px-3 py-2 text-xs backdrop-blur-sm"
+          style={{ left: wormholeHover.x + 16, top: wormholeHover.y - 12 }}>
           <p className="text-indigo-300/80">{wormholeHover.label}</p>
         </div>
       )}
 
-      {/* Z1 Dashboard panel — right side */}
+      {/* Z1 Dashboard panel */}
       {dashboard && (
         <aside className="absolute right-0 top-0 z-20 flex h-full w-80 flex-col border-l border-white/8 bg-black/70 backdrop-blur-md">
-          {/* Chain header */}
           <div className="border-b border-white/8 px-5 py-5">
             <p className="text-[10px] uppercase tracking-widest text-white/35">System View · Z1</p>
-            <h2 className="mt-1 text-xl font-bold text-white" style={{ color: dashboard.chain.color }}>
-              {dashboard.chain.name}
-            </h2>
+            <h2 className="mt-1 text-xl font-bold" style={{ color: dashboard.chain.color }}>{dashboard.chain.name}</h2>
             <p className="mt-0.5 text-sm text-white/50">{dashboard.chain.description}</p>
             <div className="mt-3 flex items-center gap-2">
               <span className="h-2 w-2 rounded-full" style={{ backgroundColor: dashboard.chain.color }} />
@@ -556,38 +511,27 @@ export default function CosmosScene({ initialChain }: Props) {
             </div>
           </div>
 
-          {/* Protocol list */}
           <div className="flex-1 overflow-y-auto px-5 py-4">
-            {dashboard.protocolsLoading && (
-              <p className="text-xs text-white/35 animate-pulse">Loading protocols…</p>
-            )}
-            {dashboard.protocolsError && !dashboard.protocolsLoading && (
-              <p className="text-xs text-white/40">Could not load protocol data.</p>
-            )}
+            {dashboard.protocolsLoading && <p className="text-xs text-white/35 animate-pulse">Loading protocols…</p>}
+            {dashboard.protocolsError && !dashboard.protocolsLoading && <p className="text-xs text-white/40">Could not load protocol data.</p>}
             {!dashboard.protocolsLoading && !dashboard.protocolsError && (
               <>
-                <p className="mb-3 text-[10px] uppercase tracking-widest text-white/30">
-                  Top Protocols · {dashboard.protocols.length}
-                </p>
+                <p className="mb-3 text-[10px] uppercase tracking-widest text-white/30">Top Protocols · {dashboard.protocols.length}</p>
                 <ul className="space-y-1">
                   {dashboard.protocols.map((p) => (
                     <li key={p.slug}>
                       <button
                         onClick={() => {
                           const refs = sceneRef.current;
-                          if (!refs) return;
-                          const star = refs.stars.find((s) => s.protocol.slug === p.slug);
-                          if (star) {
-                            refs.stars.forEach((s) => {
-                              (s.mesh.material as THREE.MeshStandardMaterial).emissiveIntensity =
-                                s === star ? 1.8 : 0.3;
+                          if (refs) {
+                            const star = refs.stars.find(s => s.protocol.slug === p.slug);
+                            if (star) refs.stars.forEach(s => {
+                              (s.mesh.material as THREE.MeshStandardMaterial).emissiveIntensity = s === star ? 1.8 : 0.3;
                             });
                           }
-                          setDashboard((prev) =>
-                            prev ? { ...prev, selectedProtocol: p, fees: null, feesLoading: true } : null
-                          );
-                          fetchProtocolFees(p.slug).then((fees) =>
-                            setDashboard((prev) => (prev ? { ...prev, fees, feesLoading: false } : null))
+                          setDashboard(prev => prev ? { ...prev, selectedProtocol: p, fees: null, feesLoading: true } : null);
+                          fetchProtocolFees(p.slug).then(fees =>
+                            setDashboard(prev => prev ? { ...prev, fees, feesLoading: false } : null)
                           );
                         }}
                         className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm transition hover:bg-white/5 ${dashboard.selectedProtocol?.slug === p.slug ? "bg-white/8" : ""}`}
@@ -602,7 +546,6 @@ export default function CosmosScene({ initialChain }: Props) {
             )}
           </div>
 
-          {/* Selected protocol detail */}
           {dashboard.selectedProtocol && (
             <div className="border-t border-white/8 px-5 py-4">
               <p className="text-[10px] uppercase tracking-widest text-white/35">Protocol</p>
@@ -618,17 +561,13 @@ export default function CosmosScene({ initialChain }: Props) {
                 </div>
                 <div className="rounded-lg bg-white/5 px-3 py-2">
                   <p className="text-[10px] uppercase tracking-wider text-white/35">24h Fees</p>
-                  {dashboard.feesLoading
-                    ? <p className="text-xs text-white/30 animate-pulse">loading…</p>
-                    : <p className="text-sm font-semibold text-white">{dashboard.fees?.totalFees24h != null ? formatTVL(dashboard.fees.totalFees24h) : "—"}</p>
-                  }
+                  {dashboard.feesLoading ? <p className="text-xs text-white/30 animate-pulse">loading…</p>
+                    : <p className="text-sm font-semibold text-white">{dashboard.fees?.totalFees24h != null ? formatTVL(dashboard.fees.totalFees24h) : "—"}</p>}
                 </div>
                 <div className="rounded-lg bg-white/5 px-3 py-2">
                   <p className="text-[10px] uppercase tracking-wider text-white/35">24h Revenue</p>
-                  {dashboard.feesLoading
-                    ? <p className="text-xs text-white/30 animate-pulse">loading…</p>
-                    : <p className="text-sm font-semibold text-white">{dashboard.fees?.totalRevenue24h != null ? formatTVL(dashboard.fees.totalRevenue24h) : "—"}</p>
-                  }
+                  {dashboard.feesLoading ? <p className="text-xs text-white/30 animate-pulse">loading…</p>
+                    : <p className="text-sm font-semibold text-white">{dashboard.fees?.totalRevenue24h != null ? formatTVL(dashboard.fees.totalRevenue24h) : "—"}</p>}
                 </div>
               </div>
             </div>
