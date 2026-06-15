@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import CosmosScene from "@/components/CosmosScene";
 import { CHAIN_CATALOG } from "@/lib/data/chains";
+import { formatTVL } from "@/lib/scene/labels";
 
 interface Props {
   params: Promise<{ chain: string }>;
@@ -10,36 +11,35 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { chain } = await params;
   const found = CHAIN_CATALOG.find((c) => c.id === chain);
   const name = found?.name ?? chain;
+  const tvlStr = found ? ` · ${formatTVL(found.tvl)} TVL` : "";
   return {
     title: `${name} — DeFi Cosmos`,
-    description: found?.description ?? `Explore ${name} in DeFi Cosmos.`,
+    description: found
+      ? `Explore ${name}${tvlStr} in DeFi Cosmos — an interactive 3D map of the DeFi ecosystem. ${found.description}`
+      : `Explore ${name} protocols in DeFi Cosmos.`,
+    openGraph: {
+      title: `${name} — DeFi Cosmos`,
+      description: found?.description ?? `Explore ${name} in DeFi Cosmos.`,
+      type: "website",
+    },
   };
 }
 
-// Scaffold — Z1 detail view (protocol breakdown, fly-to camera) built next session
+// Renders the full scene pre-focused on this chain.
+// CosmosScene reads initialChain and jumps directly into system view on mount.
 export default async function ChainPage({ params }: Props) {
   const { chain } = await params;
-  const found = CHAIN_CATALOG.find((c) => c.id === chain);
 
   return (
-    <main className="flex h-dvh flex-col items-center justify-center gap-4 bg-[#04050a] text-white">
-      <p className="text-[11px] uppercase tracking-widest text-white/35">
-        DeFi Cosmos · Z1 — coming next session
-      </p>
-      <h1 className="text-3xl font-bold" style={{ color: found?.color ?? "white" }}>
-        {found?.name ?? chain}
-      </h1>
-      {found && (
-        <p className="max-w-sm text-center text-sm text-white/50">
-          {found.description}
-        </p>
-      )}
-      <Link
-        href="/"
-        className="mt-6 rounded-full border border-white/15 px-5 py-2 text-sm text-white/60 transition hover:border-white/40 hover:text-white"
-      >
-        ← Back to Universe
-      </Link>
+    <main className="relative h-dvh w-full overflow-hidden bg-[#04050a]">
+      <CosmosScene initialChain={chain} />
+
+      {/* Branding */}
+      <header className="pointer-events-none absolute left-6 top-5 z-20 select-none">
+        <h1 className="text-xl font-bold tracking-widest text-white/90">
+          DeFi <span className="text-indigo-400">Cosmos</span>
+        </h1>
+      </header>
     </main>
   );
 }

@@ -16,7 +16,6 @@ export const metadata: Metadata = {
 export default function HomePage() {
   return (
     <main className="relative h-dvh w-full overflow-hidden bg-[#04050a]">
-      {/* Full-viewport 3D scene — owns its own data fetch */}
       <CosmosScene />
 
       {/* Branding — top left */}
