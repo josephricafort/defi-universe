@@ -14,6 +14,13 @@ import { createSystemView, tickStars, type ProtocolStar } from "@/lib/scene/syst
 import { flyTo, flyBack, fadePoints, fadeOrbs } from "@/lib/camera/flyTo";
 import { fetchChains, type Chain, type FetchStatus, CHAIN_CATALOG } from "@/lib/data/chains";
 import { getProtocolsForChain, fetchProtocolFees, type Protocol } from "@/lib/data/protocols";
+import { fetchWormholeEdges } from "@/lib/data/bridges";
+import {
+  createWormholes,
+  tickWormholes,
+  fadeWormholes,
+  type Wormhole,
+} from "@/lib/scene/wormholes";
 
 interface Props {
   initialChain?: string; // chain id, e.g. "ethereum" — set when entering via /chain/[chain]
@@ -47,6 +54,8 @@ interface SceneRefs {
   stars: ProtocolStar[];
   starfield: THREE.Points;
   systemGroup: THREE.Group | null;
+  wormholes: Wormhole[];
+  wormholeGroup: THREE.Group | null;
   homePos: THREE.Vector3;
   homeTarget: THREE.Vector3;
   viewState: ViewState;
@@ -61,6 +70,7 @@ export default function CosmosScene({ initialChain }: Props) {
   const [dataStatus, setDataStatus] = useState<FetchStatus | "loading">("loading");
   const [viewState, setViewState] = useState<ViewState>("universe");
   const [hovered, setHovered] = useState<HoverInfo | null>(null);
+  const [wormholeHover, setWormholeHover] = useState<{ label: string; x: number; y: number } | null>(null);
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
 
   // ── Load protocols + enter system view for a chain ─────────────────────────
@@ -97,9 +107,10 @@ export default function CosmosScene({ initialChain }: Props) {
 
     await handle.promise;
 
-    // Dim background
+    // Dim background + wormholes
     fadeOrbs(otherOrbs, 0.08, 1);
     fadePoints(refs.starfield, 0.08, 1);
+    fadeWormholes(refs.wormholes, 0, 1);
 
     // Fetch protocols
     let protocols: Protocol[] = [];
@@ -148,11 +159,12 @@ export default function CosmosScene({ initialChain }: Props) {
 
     const handle = flyBack(refs.camera, refs.controls, refs.homePos, refs.homeTarget);
 
-    // Fade orbs back in while flying
+    // Fade orbs + wormholes back in while flying
     const allOrbs = refs.orbs;
     const fadeInterval = setInterval(() => {
       fadeOrbs(allOrbs, 1, 0.08);
       fadePoints(refs.starfield, 0.55, 0.08);
+      fadeWormholes(refs.wormholes, 1, 0.08);
     }, 16);
 
     await handle.promise;
@@ -161,6 +173,7 @@ export default function CosmosScene({ initialChain }: Props) {
     // Ensure full opacity
     fadeOrbs(allOrbs, 1, 1);
     fadePoints(refs.starfield, 0.55, 1);
+    fadeWormholes(refs.wormholes, 1, 1);
 
     // Remove system view
     if (refs.systemGroup) {
@@ -225,6 +238,8 @@ export default function CosmosScene({ initialChain }: Props) {
       stars: [],
       starfield,
       systemGroup: null,
+      wormholes: [],
+      wormholeGroup: null,
       homePos,
       homeTarget,
       viewState: "universe",
@@ -241,6 +256,7 @@ export default function CosmosScene({ initialChain }: Props) {
       const delta = clock.getDelta();
       tickOrbs(refs.orbs, delta);
       tickStars(refs.stars, delta);
+      tickWormholes(refs.wormholes, delta);
       controls.update();
       renderer.render(scene, camera);
     }
@@ -271,6 +287,15 @@ export default function CosmosScene({ initialChain }: Props) {
         orb.mesh.add(label);
       });
 
+      // Fetch bridge volume — fire-and-forget, Z0 works fine without it
+      fetchWormholeEdges().then((edges) => {
+        if (destroyed) return;
+        const { group: wGroup, wormholes } = createWormholes(edges);
+        scene.add(wGroup);
+        refs.wormholes = wormholes;
+        refs.wormholeGroup = wGroup;
+      }).catch(() => { /* graceful degradation — no wormholes */ });
+
       // If entering via /chain/[id], fly in automatically after galaxy is built
       if (initialChain) {
         const target = chains.find((c) => c.id === initialChain)
@@ -289,6 +314,28 @@ export default function CosmosScene({ initialChain }: Props) {
       }
     });
 
+    // ── Wormhole tube raycaster (inline — small enough to not need a separate file) ──
+    function pickWormholeTube(
+      e: MouseEvent,
+      container: HTMLElement,
+      cam: THREE.Camera,
+      whs: Wormhole[]
+    ): Wormhole | null {
+      if (whs.length === 0) return null;
+      const rect = container.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      const ray = new THREE.Raycaster();
+      ray.params.Line = { threshold: 0.5 };
+      ray.setFromCamera(new THREE.Vector2(x, y), cam);
+      // Only test tube meshes (first child of each tubeGroup)
+      const tubes = whs.map((w) => w.tubeGroup.children[0] as THREE.Mesh);
+      const hits = ray.intersectObjects(tubes, false);
+      if (hits.length === 0) return null;
+      const hitMesh = hits[0].object;
+      return whs.find((w) => w.tubeGroup.children[0] === hitMesh) ?? null;
+    }
+
     // ── Hover ────────────────────────────────────────────────────────────────
     let hoveredOrbRef: ChainOrb | null = null;
     let hoveredStarRef: ProtocolStar | null = null;
@@ -300,9 +347,21 @@ export default function CosmosScene({ initialChain }: Props) {
         const hit = pickOrb(e, mount!, camera, refs.orbs);
         if (hit) {
           setHovered({ label: hit.orb.chain.name, sub: `${formatTVL(hit.orb.chain.tvl)} TVL`, x: e.clientX - rect.left, y: e.clientY - rect.top });
+          setWormholeHover(null);
           document.body.style.cursor = "pointer";
         } else {
           setHovered(null);
+          // Raycast wormhole tubes only when no orb is under cursor
+          const wHit = pickWormholeTube(e, mount!, camera, refs.wormholes);
+          if (wHit) {
+            setWormholeHover({
+              label: `${wHit.edge.to.name} ↔ Ethereum · ${formatTVL(wHit.volume24h)} (24h)`,
+              x: e.clientX - rect.left,
+              y: e.clientY - rect.top,
+            });
+          } else {
+            setWormholeHover(null);
+          }
           document.body.style.cursor = "default";
         }
         if (hoveredOrbRef && hoveredOrbRef !== hit?.orb) {
@@ -315,6 +374,7 @@ export default function CosmosScene({ initialChain }: Props) {
           hoveredOrbRef = null;
         }
       } else if (refs.viewState === "system") {
+        setWormholeHover(null);
         const hit = pickStar(e, mount!, camera, refs.stars);
         if (hit) {
           setHovered({ label: hit.star.protocol.name, sub: `${formatTVL(hit.star.protocol.tvl)} TVL`, x: e.clientX - rect.left, y: e.clientY - rect.top });
@@ -334,6 +394,7 @@ export default function CosmosScene({ initialChain }: Props) {
         }
       } else {
         setHovered(null);
+        setWormholeHover(null);
       }
     }
 
@@ -425,7 +486,7 @@ export default function CosmosScene({ initialChain }: Props) {
         </button>
       )}
 
-      {/* Hover tooltip */}
+      {/* Hover tooltip — orb or protocol star */}
       {hovered && (
         <div
           className="pointer-events-none absolute z-10 rounded-xl border border-white/10 bg-black/75 px-3 py-2 text-sm backdrop-blur-sm"
@@ -433,6 +494,16 @@ export default function CosmosScene({ initialChain }: Props) {
         >
           <p className="font-semibold text-white">{hovered.label}</p>
           <p className="text-white/55">{hovered.sub}</p>
+        </div>
+      )}
+
+      {/* Wormhole hover tooltip */}
+      {wormholeHover && !hovered && (
+        <div
+          className="pointer-events-none absolute z-10 rounded-xl border border-indigo-500/20 bg-black/75 px-3 py-2 text-xs backdrop-blur-sm"
+          style={{ left: wormholeHover.x + 16, top: wormholeHover.y - 12 }}
+        >
+          <p className="text-indigo-300/80">{wormholeHover.label}</p>
         </div>
       )}
 
