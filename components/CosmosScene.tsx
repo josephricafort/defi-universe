@@ -96,20 +96,14 @@ export default function CosmosScene({ initialChain }: Props) {
     // Update URL
     router.replace(`/chain/${chain.id}`, { scroll: false });
 
-    // Fly camera to chain orb
+    // Fly camera to chain orb — proximity fade handles orbs/starfield in render loop
     const chainPos = new THREE.Vector3(...chain.position);
     const handle = flyTo(refs.camera, refs.controls, chainPos, { offsetDistance: 28 });
-    refs.controls.autoRotate = false;
     refs.controls.enabled = false;
-
-    // Fade out other orbs + starfield while flying
-    const otherOrbs = refs.orbs.filter((o) => o.chain.id !== chain.id);
 
     await handle.promise;
 
-    // Dim background + wormholes
-    fadeOrbs(otherOrbs, 0.08, 1);
-    fadePoints(refs.starfield, 0.08, 1);
+    // Snap wormholes fully off now that we've arrived
     fadeWormholes(refs.wormholes, 0, 1);
 
     // Fetch protocols
@@ -186,9 +180,8 @@ export default function CosmosScene({ initialChain }: Props) {
     setViewState("universe");
     setDashboard(null);
 
-    refs.controls.minDistance = 20;
-    refs.controls.maxDistance = 400;
-    refs.controls.autoRotate = true;
+    refs.controls.minDistance = 15;
+    refs.controls.maxDistance = 500;
     refs.controls.enabled = true;
   }, [router]);
 
@@ -209,10 +202,9 @@ export default function CosmosScene({ initialChain }: Props) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x04050a);
 
-    // Camera
+    // Camera — start above and back from scene centroid (not Ethereum specifically)
     const camera = new THREE.PerspectiveCamera(55, mount.clientWidth / mount.clientHeight, 0.5, 1200);
-    camera.position.set(0, 55, 160);
-    camera.lookAt(0, 0, 0);
+    camera.position.set(0, 80, 200);
 
     // Lighting
     scene.add(new THREE.AmbientLight(0x1a1a3a, 3.5));
@@ -224,8 +216,10 @@ export default function CosmosScene({ initialChain }: Props) {
     const starfield = createStarfield();
     scene.add(starfield);
 
-    // Controls
+    // Controls — target the rough centroid of the galaxy, not (0,0,0) = Ethereum
     const controls = createOrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 5, 0); // slight Y offset to centre the spread visually
+    controls.update();
     const homePos = camera.position.clone();
     const homeTarget = controls.target.clone();
 
@@ -258,6 +252,47 @@ export default function CosmosScene({ initialChain }: Props) {
       tickStars(refs.stars, delta);
       tickWormholes(refs.wormholes, delta);
       controls.update();
+
+      // Proximity fade: as camera approaches any orb during free navigation,
+      // fade other orbs + wormholes so the target chain stands out naturally.
+      if (refs.viewState === "universe" && refs.orbs.length > 0) {
+        // Find the closest orb to camera
+        let minDist = Infinity;
+        let closestOrb: ChainOrb | null = null;
+        for (const orb of refs.orbs) {
+          const d = camera.position.distanceTo(orb.mesh.position);
+          if (d < minDist) { minDist = d; closestOrb = orb; }
+        }
+        // When camera is within 60 units of an orb, fade others proportionally
+        const FADE_START = 60;
+        const FADE_FULL = 20; // at this distance others are nearly invisible
+        if (closestOrb && minDist < FADE_START) {
+          const t = 1 - Math.min((minDist - FADE_FULL) / (FADE_START - FADE_FULL), 1);
+          const otherOpacity = THREE.MathUtils.lerp(1, 0.06, t);
+          const wormholeOpacity = THREE.MathUtils.lerp(1, 0, t);
+          for (const orb of refs.orbs) {
+            const isClose = orb === closestOrb;
+            const mat = orb.mesh.material as THREE.MeshStandardMaterial;
+            mat.transparent = true;
+            mat.opacity = isClose ? 1 : otherOpacity;
+            const gMat = orb.glowSprite.material as THREE.SpriteMaterial;
+            gMat.opacity = isClose ? 1 : otherOpacity;
+          }
+          fadePoints(refs.starfield, THREE.MathUtils.lerp(0.55, 0.06, t), 0.05);
+          fadeWormholes(refs.wormholes, wormholeOpacity, 0.05);
+        } else {
+          // Restore full opacity when away from any orb
+          for (const orb of refs.orbs) {
+            const mat = orb.mesh.material as THREE.MeshStandardMaterial;
+            mat.opacity = THREE.MathUtils.lerp(mat.opacity ?? 1, 1, 0.05);
+            const gMat = orb.glowSprite.material as THREE.SpriteMaterial;
+            gMat.opacity = THREE.MathUtils.lerp(gMat.opacity ?? 1, 1, 0.05);
+          }
+          fadePoints(refs.starfield, 0.55, 0.05);
+          fadeWormholes(refs.wormholes, 1, 0.05);
+        }
+      }
+
       renderer.render(scene, camera);
     }
     animate();
@@ -301,14 +336,12 @@ export default function CosmosScene({ initialChain }: Props) {
         const target = chains.find((c) => c.id === initialChain)
           ?? CHAIN_CATALOG.find((c) => c.id === initialChain);
         if (target) {
-          // Skip fly animation on direct load — jump camera instantly then show system view
+          // Jump camera to chain on direct load (no fly animation needed)
           const chainPos = new THREE.Vector3(...target.position);
-          const dir = camera.position.clone().sub(chainPos).normalize();
+          const dir = new THREE.Vector3(0, 1, 1).normalize();
           camera.position.copy(chainPos.clone().add(dir.multiplyScalar(28)));
           controls.target.copy(chainPos);
           controls.update();
-          fadeOrbs(orbs.filter(o => o.chain.id !== target.id), 0.08, 1);
-          fadePoints(starfield, 0.08, 1);
           await enterSystemView(target, refs);
         }
       }

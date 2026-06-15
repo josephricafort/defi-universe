@@ -8,16 +8,22 @@ export function createOrbitControls(
   const controls = new OrbitControls(camera, domElement);
 
   controls.enableDamping = true;
-  controls.dampingFactor = 0.06;
-  controls.rotateSpeed = 0.5;
-  controls.zoomSpeed = 0.8;
-  controls.minDistance = 20;
-  controls.maxDistance = 400;
-  // Slightly constrain vertical rotation so the galaxy stays framed
-  controls.minPolarAngle = Math.PI * 0.15;
-  controls.maxPolarAngle = Math.PI * 0.85;
-  controls.autoRotate = true;
-  controls.autoRotateSpeed = 0.15;
+  controls.dampingFactor = 0.05;
+  controls.rotateSpeed = 0.55;
+  controls.zoomSpeed = 0.9;
+  controls.panSpeed = 0.8;
+
+  // Free navigation — no orbit lock, no auto-rotate
+  controls.enablePan = true;
+  controls.autoRotate = false;
+
+  // Universe view zoom range
+  controls.minDistance = 15;
+  controls.maxDistance = 500;
+
+  // No polar clamping — free vertical orbit
+  controls.minPolarAngle = 0;
+  controls.maxPolarAngle = Math.PI;
 
   return controls;
 }
